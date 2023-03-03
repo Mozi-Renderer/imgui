@@ -1,4 +1,4 @@
-// dear imgui: Platform Backend for Windows (standard windows API for 32 and 64 bits applications)
+// dear imgui: Platform Backend for Windows (standard windows API for 32-bits AND 64-bits applications)
 // This needs to be used along with a Renderer (e.g. DirectX11, OpenGL3, Vulkan..)
 
 // Implemented features:
@@ -35,7 +35,9 @@ typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, XINPUT_STATE*);
 
 // CHANGELOG
 // (minor and older changes stripped away, please see git history for details)
-//  2022-XX-XX: Platform: Added support for multiple windows via the ImGuiPlatformIO interface.
+//  2023-XX-XX: Platform: Added support for multiple windows via the ImGuiPlatformIO interface.
+//  2023-02-15: Inputs: Use WM_NCMOUSEMOVE / WM_NCMOUSELEAVE to track mouse position over non-client area (e.g. OS decorations) when app is not focused. (#6045, #6162)
+//  2023-02-02: Inputs: Flipping WM_MOUSEHWHEEL (horizontal mouse-wheel) value to match other backends and offer consistent horizontal scrolling direction. (#4019, #6096, #1463)
 //  2022-10-11: Using 'nullptr' instead of 'NULL' as per our switch to C++11.
 //  2022-09-28: Inputs: Convert WM_CHAR values with MultiByteToWideChar() when window class was registered as MBCS (not Unicode).
 //  2022-09-26: Inputs: Renamed ImGuiKey_ModXXX introduced in 1.87 to ImGuiMod_XXX (old names still supported).
@@ -90,16 +92,16 @@ struct ImGui_ImplWin32_Data
 {
     HWND                        hWnd;
     HWND                        MouseHwnd;
-    bool                        MouseTracked;
+    int                         MouseTrackedArea;   // 0: not tracked, 1: client are, 2: non-client area
     int                         MouseButtonsDown;
     INT64                       Time;
     INT64                       TicksPerSecond;
     ImGuiMouseCursor            LastMouseCursor;
-    bool                        HasGamepad;
-    bool                        WantUpdateHasGamepad;
     bool                        WantUpdateMonitors;
 
 #ifndef IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
+    bool                        HasGamepad;
+    bool                        WantUpdateHasGamepad;
     HMODULE                     XInputDLL;
     PFN_XInputGetCapabilities   XInputGetCapabilities;
     PFN_XInputGetState          XInputGetState;
@@ -139,7 +141,6 @@ bool    ImGui_ImplWin32_Init(void* hwnd)
     io.BackendFlags |= ImGuiBackendFlags_HasMouseHoveredViewport; // We can call io.AddMouseViewportEvent() with correct data (optional)
 
     bd->hWnd = (HWND)hwnd;
-    bd->WantUpdateHasGamepad = true;
     bd->WantUpdateMonitors = true;
     bd->TicksPerSecond = perf_frequency;
     bd->Time = perf_counter;
@@ -153,6 +154,7 @@ bool    ImGui_ImplWin32_Init(void* hwnd)
 
     // Dynamically load XInput library
 #ifndef IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
+    bd->WantUpdateHasGamepad = true;
     const char* xinput_dll_names[] =
     {
         "xinput1_4.dll",   // Windows 8+
@@ -289,7 +291,8 @@ static void ImGui_ImplWin32_UpdateMouseData()
         }
 
         // (Optional) Fallback to provide mouse position when focused (WM_MOUSEMOVE already provides this when hovered or captured)
-        if (!io.WantSetMousePos && !bd->MouseTracked && has_mouse_screen_pos)
+        // This also fills a short gap when clicking non-client area: WM_NCMOUSELEAVE -> modal OS move -> gap -> WM_NCMOUSEMOVE
+        if (!io.WantSetMousePos && bd->MouseTrackedArea == 0 && has_mouse_screen_pos)
         {
             // Single viewport mode: mouse position in client window coordinates (io.MousePos is (0,0) when the mouse is on the upper-left corner of the app window)
             // (This is the position you can get with ::GetCursorPos() + ::ScreenToClient() or WM_MOUSEMOVE.)
@@ -586,27 +589,42 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
     switch (msg)
     {
     case WM_MOUSEMOVE:
+    case WM_NCMOUSEMOVE:
     {
         // We need to call TrackMouseEvent in order to receive WM_MOUSELEAVE events
+        const int area = (msg == WM_MOUSEMOVE) ? 1 : 2;
         bd->MouseHwnd = hwnd;
-        if (!bd->MouseTracked)
+        if (bd->MouseTrackedArea != area)
         {
-            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
-            ::TrackMouseEvent(&tme);
-            bd->MouseTracked = true;
+            TRACKMOUSEEVENT tme_cancel = { sizeof(tme_cancel), TME_CANCEL, hwnd, 0 };
+            TRACKMOUSEEVENT tme_track = { sizeof(tme_track), (DWORD)((area == 2) ? (TME_LEAVE | TME_NONCLIENT) : TME_LEAVE), hwnd, 0 };
+            if (bd->MouseTrackedArea != 0)
+                ::TrackMouseEvent(&tme_cancel);
+            ::TrackMouseEvent(&tme_track);
+            bd->MouseTrackedArea = area;
         }
         POINT mouse_pos = { (LONG)GET_X_LPARAM(lParam), (LONG)GET_Y_LPARAM(lParam) };
-        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+        bool want_absolute_pos = (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
+        if (msg == WM_MOUSEMOVE && want_absolute_pos)    // WM_MOUSEMOVE are client-relative coordinates.
             ::ClientToScreen(hwnd, &mouse_pos);
+        if (msg == WM_NCMOUSEMOVE && !want_absolute_pos) // WM_NCMOUSEMOVE are absolute coordinates.
+            ::ScreenToClient(hwnd, &mouse_pos);
         io.AddMousePosEvent((float)mouse_pos.x, (float)mouse_pos.y);
         break;
     }
     case WM_MOUSELEAVE:
-        if (bd->MouseHwnd == hwnd)
-            bd->MouseHwnd = nullptr;
-        bd->MouseTracked = false;
-        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+    case WM_NCMOUSELEAVE:
+    {
+        const int area = (msg == WM_MOUSELEAVE) ? 1 : 2;
+        if (bd->MouseTrackedArea == area)
+        {
+            if (bd->MouseHwnd == hwnd)
+                bd->MouseHwnd = nullptr;
+            bd->MouseTrackedArea = 0;
+            io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        }
         break;
+    }
     case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
     case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK:
     case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK:
@@ -643,7 +661,7 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
         io.AddMouseWheelEvent(0.0f, (float)GET_WHEEL_DELTA_WPARAM(wParam) / (float)WHEEL_DELTA);
         return 0;
     case WM_MOUSEHWHEEL:
-        io.AddMouseWheelEvent((float)GET_WHEEL_DELTA_WPARAM(wParam) / (float)WHEEL_DELTA, 0.0f);
+        io.AddMouseWheelEvent(-(float)GET_WHEEL_DELTA_WPARAM(wParam) / (float)WHEEL_DELTA, 0.0f);
         return 0;
     case WM_KEYDOWN:
     case WM_KEYUP:
@@ -712,8 +730,10 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
             return 1;
         return 0;
     case WM_DEVICECHANGE:
+#ifndef IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
         if ((UINT)wParam == DBT_DEVNODES_CHANGED)
             bd->WantUpdateHasGamepad = true;
+#endif
         return 0;
     case WM_DISPLAYCHANGE:
         bd->WantUpdateMonitors = true;
